@@ -21,10 +21,8 @@ type Transaction struct {
 }
 
 func main() {
-	// Initialize Fiber app
 	app := fiber.New()
 
-	// Database connection
 	db, err := sql.Open("mysql", "root@tcp(db:3306)/codetest")
 	if err != nil {
 		log.Fatal(err)
@@ -36,13 +34,11 @@ func main() {
 		}
 	}(db)
 
-	// Mutex for protecting database access
+	// データベースアクセスを保護するためのMutex
 	var mu sync.Mutex
 
-	// Route handlers
 	app.Post("/transactions", createTransactionHandler(db, &mu))
 
-	// Start server
 	log.Fatal(app.Listen(":8888"))
 }
 
@@ -53,7 +49,7 @@ func createTransactionHandler(db *sql.DB, mu *sync.Mutex) fiber.Handler {
 			return BadRequest(c, err)
 		}
 
-		// 通过互斥锁保护对数据库的访问
+		// データベースアクセスを保護するためのMutexをロックする
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -72,7 +68,7 @@ func InternalServerError(c *fiber.Ctx, err error) error {
 }
 
 func handleTransaction(c *fiber.Ctx, db *sql.DB, transaction Transaction) error {
-	// Begin transaction
+	// 1. トランザクションを作成する
 	tx, err := db.Begin()
 	if err != nil {
 		return InternalServerError(c, err)
@@ -89,7 +85,7 @@ func handleTransaction(c *fiber.Ctx, db *sql.DB, transaction Transaction) error 
 		}
 	}()
 
-	// Query total amount for the user
+	// 2. ユーザーの合計取引金額を取得する
 	var totalAmount sql.NullInt64
 	if err := tx.QueryRow("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id=?", transaction.UserID).Scan(&totalAmount); err != nil {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil {
@@ -99,7 +95,7 @@ func handleTransaction(c *fiber.Ctx, db *sql.DB, transaction Transaction) error 
 		return InternalServerError(c, err)
 	}
 
-	// Check if adding the new transaction will exceed the limit
+	// 3. 登録可能な取引金額上限を超えていないかを確認する
 	if totalAmount.Int64+int64(transaction.Amount) > amountLimit {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil {
 			log.Printf("Rollback error: %v", rollbackErr)
@@ -108,7 +104,7 @@ func handleTransaction(c *fiber.Ctx, db *sql.DB, transaction Transaction) error 
 			fmt.Sprintf("Total amount exceeds limit of %d", amountLimit))
 	}
 
-	// Insert transaction into database
+	// 4. データベースにトランザクションを挿入する
 	_, err = tx.Exec("INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)",
 		transaction.UserID, transaction.Amount, transaction.Description)
 	if err != nil {
@@ -119,15 +115,14 @@ func handleTransaction(c *fiber.Ctx, db *sql.DB, transaction Transaction) error 
 		return InternalServerError(c, err)
 	}
 
-	// Commit the transaction
+	// 5. トランザクションをコミットする
 	if err = tx.Commit(); err != nil {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil {
-			log.Printf("Rollback error: %v", rollbackErr)
+			log.Printf("ロールバックエラー: %v", rollbackErr)
 		}
 		log.Printf("Commit error: %v", err)
 		return InternalServerError(c, err)
 	}
 
-	// Return appropriate response based on the transaction result
 	return c.Status(fiber.StatusCreated).SendString("Transaction created successfully")
 }
