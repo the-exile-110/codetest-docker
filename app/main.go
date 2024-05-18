@@ -3,10 +3,11 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/gofiber/fiber/v2"
 	"log"
 	"sync"
+
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/gofiber/fiber/v2"
 )
 
 const (
@@ -28,9 +29,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	defer func(db *sql.DB) {
+		err := db.Close()
+		if err != nil {
+			log.Fatal("Failed to close database connection: ", err)
+		}
+	}(db)
 
-	// 互斥锁
+	// Mutex for protecting database access
 	var mu sync.Mutex
 
 	// Route handlers
@@ -57,17 +63,25 @@ func createTransactionHandler(db *sql.DB, mu *sync.Mutex) fiber.Handler {
 			return c.Status(fiber.StatusInternalServerError).SendString(err.Error())
 		}
 
+		defer func() {
+			if p := recover(); p != nil {
+				tx.Rollback()
+				log.Printf("Recovered from panic: %v", p)
+				c.Status(fiber.StatusInternalServerError).SendString("Internal server error")
+			}
+		}()
+
 		// Query total amount for the user
 		var totalAmount sql.NullInt64
 		if err := tx.QueryRow("SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE user_id=?", transaction.UserID).Scan(&totalAmount); err != nil {
+			tx.Rollback()
+			log.Printf("QueryRow error: %v", err)
 			return c.Status(fiber.StatusInternalServerError).SendString(err.Error())
 		}
 
 		// Check if adding the new transaction will exceed the limit
 		if totalAmount.Int64+int64(transaction.Amount) > amountLimit {
-			if err := tx.Rollback(); err != nil {
-				return c.Status(fiber.StatusInternalServerError).SendString(err.Error())
-			}
+			tx.Rollback()
 			return c.Status(fiber.StatusPaymentRequired).SendString(
 				fmt.Sprintf("Total amount exceeds limit of %d", amountLimit))
 		}
@@ -76,31 +90,19 @@ func createTransactionHandler(db *sql.DB, mu *sync.Mutex) fiber.Handler {
 		_, err = tx.Exec("INSERT INTO transactions (user_id, amount, description) VALUES (?, ?, ?)",
 			transaction.UserID, transaction.Amount, transaction.Description)
 		if err != nil {
-			err = tx.Rollback()
-			if err != nil {
-				fmt.Println(err)
-				return err
-			}
+			tx.Rollback()
+			log.Printf("Exec error: %v", err)
 			return c.Status(fiber.StatusInternalServerError).SendString(err.Error())
 		}
 
 		// Commit the transaction
 		if err = tx.Commit(); err != nil {
-			err = tx.Rollback()
-			if err != nil {
-				fmt.Println(err)
-				return err
-			}
+			tx.Rollback()
+			log.Printf("Commit error: %v", err)
 			return c.Status(fiber.StatusInternalServerError).SendString(err.Error())
 		}
 
 		// Return appropriate response based on the transaction result
-		// Use StatusCreated if the transaction was successfully created
-		// Use StatusPaymentRequired if the total amount exceeds the limit
-		if totalAmount.Int64+int64(transaction.Amount) > amountLimit {
-			return c.Status(fiber.StatusPaymentRequired).SendString(
-				fmt.Sprintf("Total amount exceeds limit of %d", amountLimit))
-		}
 		return c.Status(fiber.StatusCreated).SendString("Transaction created successfully")
 	}
 }
